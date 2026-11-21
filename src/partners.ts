@@ -110,6 +110,51 @@ async function syncCsvPartnerRow(
     .run();
 }
 
+export function parseCsvRows(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = "";
+  let inQuotes = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') {
+          field += '"';
+          i += 1;
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        field += ch;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ",") {
+      row.push(field.trim());
+      field = "";
+    } else if (ch === "\r" || ch === "\n") {
+      if (ch === "\r" && text[i + 1] === "\n") i += 1;
+      row.push(field.trim());
+      rows.push(row);
+      row = [];
+      field = "";
+    } else {
+      field += ch;
+    }
+  }
+
+  if (field.length > 0 || row.length > 0) {
+    row.push(field.trim());
+    rows.push(row);
+  }
+  return rows;
+}
+
 /**
  * Parse and sync the Hub partner sheet CSV (sections: Base, Robinhood, Elysium).
  */
@@ -124,12 +169,11 @@ export async function syncPartnersFromCsv(
       return { ok: false, synced: 0, error: `Partner CSV HTTP ${res.status}` };
     }
     const text = await res.text();
-    const lines = text.split(/\r?\n/);
+    const rows = parseCsvRows(text);
     let currentSection = "";
     let synced = 0;
 
-    for (const line of lines) {
-      const cols = line.split(",").map((c) => c.trim());
+    for (const cols of rows) {
       if (cols[0]) {
         currentSection = cols[0];
       }

@@ -533,7 +533,7 @@ test("live integration helpers: SSE+TSV parsing, Host header, and partner CSV sy
   const db = createMockD1();
   const csv = [
     ",Freq,Active partners,Expired Partner ,Blacklist",
-    "Base,HIGH,https://x.com/Uptopia_xyz,https://x.com/Wach_AI,https://x.com/Stonxfun",
+    'Base,"HIGH, weekly",https://x.com/Uptopia_xyz,https://x.com/Wach_AI,https://x.com/Stonxfun',
     "Robinhood,MEDIUM,https://x.com/DogestarOnRH,,",
   ].join("\n");
   const csvFetch = (async () => new Response(csv, { status: 200 })) as unknown as typeof fetch;
