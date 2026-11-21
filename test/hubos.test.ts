@@ -293,3 +293,185 @@ test("all markdown and skill files in hubos contain zero em dashes", () => {
     expect(/[—–]/.test(content)).toBe(false);
   }
 });
+
+test("review regressions: briefings, drafts, gold opt-out, windowed doomscroll, and proposal-proof cooldowns", async () => {
+  const db = createMockD1();
+  const now = Math.floor(Date.now() / 1000);
+  const env: Env = {
+    DB: db,
+    HUB_MCP_TOKEN: "hub-secret",
+    XEFFECT_URL: "https://xeffect.example/mcp",
+    XEFFECT_TOKEN: "xeffect-secret",
+  };
+
+  const callMcp = async (name: string, args: Record<string, unknown>) => {
+    const res = await handleHubMcp(
+      new Request("https://hubos/mcp", {
+        method: "POST",
+        headers: { authorization: "Bearer hub-secret", "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name, arguments: args },
+        }),
+      }),
+      env,
+    );
+    const json = (await res.json()) as { result: { content: Array<{ text: string }> } };
+    return JSON.parse(json.result.content[0]?.text ?? "{}");
+  };
+
+  // 1 & 6 & 7: Same-second draft saves succeed, pending_drafts expose full body/sources/vibe, and save_as_gold=false is honored
+  const draft1 = await callMcp("hub_draft_save", {
+    page_id: "basehub",
+    series: "daily_recap",
+    body: "Base Daily Recap (Nov 21)\n\n- @alpha shipped v2 pools with $18M volume.",
+    source_urls: ["https://x.com/alpha/status/1"],
+  });
+  const draft2 = await callMcp("hub_draft_save", {
+    page_id: "basehub",
+    series: "spotlight",
+    body: "Builder Spotlight: @beta\n\n@beta opened USDC vaults at 6.4% APY.",
+    source_urls: ["https://x.com/beta/status/2"],
+  });
+  expect(draft1.draft_id).toBeDefined();
+  expect(draft2.draft_id).toBeDefined();
+  expect(draft1.draft_id).not.toBe(draft2.draft_id);
+
+  // 2 & 3 & 4: Seed an active project + a silent project with stale momentum + older 15d signal
+  await db
+    .prepare(
+      `INSERT INTO projects (handle, name, ecosystem, pages_json, category, tier, followers_count, posts_7d, posts_30d, avg_eng_7d, cross_mentions_72h, active, updated_at)
+       VALUES (?, ?, 'base', '["basehub"]', 'infra', 1, 10000, 9, 20, 500, 5, 1, ?)`,
+    )
+    .bind("silentproj", "Silent Proj", now - 86400)
+    .run();
+  await db
+    .prepare(
+      `INSERT INTO projects (handle, name, ecosystem, pages_json, category, tier, followers_count, posts_7d, posts_30d, avg_eng_7d, cross_mentions_72h, active, updated_at)
+       VALUES (?, ?, 'base', '["basehub"]', 'defi', 1, 10000, 1, 1, 10, 0, 1, ?)`,
+    )
+    .bind("activeproj", "Active Proj", now - 86400)
+    .run();
+  await db
+    .prepare(
+      `INSERT INTO signals (signal_id, handle, ecosystem, text, source_url, created_at, likes, reposts, bookmarks, views, ship_score, ship_tags_json, covered_pages_json)
+       VALUES ('old-15d', 'activeproj', 'base', 'Earlier v2 upgrade live on Base', 'https://x.com/activeproj/status/old', ?, 50, 10, 5, 1000, 10, '["launch"]', '[]')`,
+    )
+    .bind(now - 15 * 86400)
+    .run();
+  await db
+    .prepare(
+      `INSERT INTO signals (signal_id, handle, ecosystem, text, source_url, created_at, likes, reposts, bookmarks, views, ship_score, ship_tags_json, covered_pages_json)
+       VALUES ('mid-5d', 'activeproj', 'base', 'Audit completed on Base', 'https://x.com/activeproj/status/mid', ?, 100, 0, 0, 2000, 7, '["funding_audit"]', '[]')`,
+    )
+    .bind(now - 5 * 86400)
+    .run();
+
+  const syncFetch = (async () =>
+    Response.json({
+      jsonrpc: "2.0",
+      id: 1,
+      result: {
+        content: [
+          {
+            text: JSON.stringify({
+              posts: [
+                {
+                  post_id: "fresh-1",
+                  handle: "activeproj",
+                  text: "Shipped mainnet v3 with @silentproj integration",
+                  url: "https://x.com/activeproj/status/fresh",
+                  created_at: now - 3600,
+                  likes: 200,
+                  reposts: 0,
+                  bookmarks: 0,
+                  views: 5000,
+                },
+              ],
+            }),
+          },
+        ],
+      },
+    })) as unknown as typeof fetch;
+
+  const syncRes = await syncDoomscroll(env, {
+    ecosystem: "base",
+    hours: 24,
+    fetchImpl: syncFetch,
+  });
+  expect(syncRes.ok).toBe(true);
+  expect(syncRes.projects_updated).toBe(2);
+
+  const silentRow = await db
+    .prepare(
+      "SELECT posts_7d, posts_30d, avg_eng_7d, cross_mentions_72h FROM projects WHERE handle = 'silentproj'",
+    )
+    .first<{
+      posts_7d: number;
+      posts_30d: number;
+      avg_eng_7d: number;
+      cross_mentions_72h: number;
+    }>();
+  expect(silentRow).toEqual({ posts_7d: 0, posts_30d: 0, avg_eng_7d: 0, cross_mentions_72h: 1 });
+
+  const activeRow = await db
+    .prepare(
+      "SELECT posts_7d, posts_30d, avg_eng_7d, cross_mentions_72h FROM projects WHERE handle = 'activeproj'",
+    )
+    .first<{
+      posts_7d: number;
+      posts_30d: number;
+      avg_eng_7d: number;
+      cross_mentions_72h: number;
+    }>();
+  expect(activeRow).toEqual({ posts_7d: 2, posts_30d: 3, avg_eng_7d: 150, cross_mentions_72h: 0 });
+
+  // Briefing includes synced top_signals, latest_signal_at, and full pending_drafts
+  const briefing = await callMcp("hub_briefing", { page_id: "basehub" });
+  const basePage = briefing.pages[0];
+  expect(basePage.latest_signal_at).toBe(now - 3600);
+  expect(basePage.top_signals.length).toBeGreaterThanOrEqual(1);
+  expect(basePage.top_signals[0].text).toContain("mainnet v3");
+  expect(basePage.pending_drafts.length).toBe(2);
+  expect(basePage.pending_drafts[0].body).toContain("@");
+  expect(Array.isArray(basePage.pending_drafts[0].source_urls)).toBe(true);
+  expect(typeof basePage.pending_drafts[0].vibe_passed).toBe("boolean");
+
+  // Gold opt-out honored even with edited_body
+  const decideRes = await callMcp("hub_draft_decide", {
+    draft_id: draft1.draft_id,
+    status: "approved",
+    edited_body: "Edited clean copy",
+    save_as_gold: false,
+  });
+  expect(decideRes.is_gold_example).toBe(false);
+  const briefingAfter = await callMcp("hub_briefing", { page_id: "basehub" });
+  expect(briefingAfter.pages[0].gold_examples).toHaveLength(0);
+
+  // 5: 35 newer 'proposed' rows do not erase an active 21d spotlight cooldown
+  await db
+    .prepare(
+      `INSERT INTO selection_history (pick_id, page_id, series, handle, category, total_score, momentum_score, ship_score, tier_fit_score, cooldown_score, learned_score, evidence_urls_json, decision, created_at)
+       VALUES ('approved-spotlight', 'basehub', 'spotlight', 'activeproj', 'defi', 50, 15, 15, 15, 5, 0, '[]', 'approved', ?)`,
+    )
+    .bind(now - 2 * 86400)
+    .run();
+  for (let i = 0; i < 35; i++) {
+    await db
+      .prepare(
+        `INSERT INTO selection_history (pick_id, page_id, series, handle, category, total_score, momentum_score, ship_score, tier_fit_score, cooldown_score, learned_score, evidence_urls_json, decision, created_at)
+         VALUES (?, 'basehub', 'spotlight', 'activeproj', 'defi', 40, 10, 10, 15, 5, 0, '[]', 'proposed', ?)`,
+      )
+      .bind(`prop-${i}`, now - 3600 + i)
+      .run();
+  }
+  const ranked = await rankProjectsForSeries(db, {
+    pageId: "basehub",
+    series: "spotlight",
+    replay: true,
+  });
+  const activeCandidate = ranked.candidates.find((c) => c.handle === "activeproj");
+  expect(activeCandidate?.scores.cooldown).toBeLessThanOrEqual(-40);
+});
