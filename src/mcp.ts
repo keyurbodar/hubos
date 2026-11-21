@@ -294,7 +294,7 @@ export async function handleHubMcp(
       });
 
       const now = Math.floor(Date.now() / 1000);
-      const draftId = `draft_${now}_${pageId}`;
+      const draftId = `draft_${now}_${crypto.randomUUID().slice(0, 8)}_${pageId}`;
       await env.DB.prepare(`
         INSERT INTO drafts (
           draft_id, page_id, series, target_handle, body, source_urls_json,
