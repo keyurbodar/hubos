@@ -206,10 +206,25 @@ export async function handleHubMcp(
               getTopPerformingHooks(env.DB, p.page_id, 14),
               getGoldExamples(env.DB, p.page_id),
               env.DB.prepare(
-                "SELECT draft_id, series, target_handle, status, created_at FROM drafts WHERE page_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 10",
+                `SELECT draft_id, series, target_handle, body, edited_body, source_urls_json, vibe_passed, vibe_issues_json, status, created_at
+                 FROM drafts
+                 WHERE page_id = ? AND status = 'pending'
+                 ORDER BY created_at DESC
+                 LIMIT 10`,
               )
                 .bind(p.page_id)
-                .all(),
+                .all<{
+                  draft_id: string;
+                  series: string;
+                  target_handle: string | null;
+                  body: string;
+                  edited_body: string | null;
+                  source_urls_json: string;
+                  vibe_passed: number;
+                  vibe_issues_json: string;
+                  status: string;
+                  created_at: number;
+                }>(),
               env.DB.prepare(
                 `SELECT signal_id, handle, text, source_url, created_at, likes, reposts, bookmarks, views, ship_score, ship_tags_json
                  FROM signals
@@ -254,7 +269,18 @@ export async function handleHubMcp(
               ship_score: s.ship_score,
               ship_tags: JSON.parse(s.ship_tags_json || "[]") as string[],
             })),
-            pending_drafts: pending.results ?? [],
+            pending_drafts: (pending.results ?? []).map((d) => ({
+              draft_id: d.draft_id,
+              series: d.series,
+              target_handle: d.target_handle,
+              body: d.body,
+              edited_body: d.edited_body,
+              source_urls: JSON.parse(d.source_urls_json || "[]") as string[],
+              vibe_passed: Boolean(d.vibe_passed),
+              vibe_issues: JSON.parse(d.vibe_issues_json || "[]") as unknown[],
+              status: d.status,
+              created_at: d.created_at,
+            })),
             active_partners: partners,
             top_hooks_14d: topHooks,
             gold_examples: goldExamples,
