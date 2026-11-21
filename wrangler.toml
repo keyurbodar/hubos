@@ -19,9 +19,12 @@ crons = ["30 4 * * 1-6"]
 
 [vars]
 XEFFECT_URL = "https://xeffect.keyurbodar18.workers.dev/mcp"
+NOTION_SPACE_ID = "835b528e-c5a8-4a45-896b-ff702fdbc807"
+NOTION_COLLECTION_ID = "2c83c88d-5f69-81c5-93d6-000b91d99eae"
+NOTION_VIEW_ID = "2c83c88d-5f69-81c2-a200-000c87115fd9"
 
 # Secrets (set via `wrangler secret put`):
 # - HUB_MCP_TOKEN: bearer token for hubos /mcp
 # - XEFFECT_TOKEN: bearer token for the general xeffect /mcp server
 # - PARTNER_SHEET_CSV_URL: optional private CSV export URL for partner tracker
-# - NOTION_TOKEN: optional Notion integration token (read-only until approved)
+# - NOTION_COOKIE: Notion session cookie header / JSON for read-only v3 API access

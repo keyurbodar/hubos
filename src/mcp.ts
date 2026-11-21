@@ -1,5 +1,6 @@
 import { getDoomscrollHealth, syncDoomscroll } from "./doomscroll.ts";
 import { getGoldExamples, getRecentHooks, getTopPerformingHooks } from "./metrics.ts";
+import { checkNotionHealth, getNotionPage, listNotionTasks, type NotionTask } from "./notion.ts";
 import { listActivePartners, syncPartnersFromCsv, upsertPartner } from "./partners.ts";
 import { rankProjectsForSeries, recordPickDecision } from "./picker.ts";
 import type { Env, PageConfig } from "./types.ts";
@@ -135,6 +136,42 @@ const TOOLS = [
     description: "Check upstream xeffect MCP health, cookie validity, and 429 rate-limit status.",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "notion_tasks",
+    description:
+      "Read-only query of HB Block Notion tasks from the Partner content database. Filter by page_id, channel, status, open_only, or only_with_comments.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: {
+          type: "string",
+          enum: ["basehub", "aionbase", "robinhub", "robinhoodhub", "elysiumhub"],
+        },
+        channel: { type: "string" },
+        status: { type: "string" },
+        open_only: { type: "boolean", default: true },
+        only_with_comments: { type: "boolean", default: false },
+        limit: { type: "number", default: 100 },
+      },
+    },
+  },
+  {
+    name: "notion_page",
+    description:
+      "Read-only fetch of a Notion task page body blocks and all discussion comments (accepts page ID or Notion URL).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string" },
+      },
+      required: ["page_id"],
+    },
+  },
+  {
+    name: "notion_health",
+    description: "Check whether the Notion session cookie (NOTION_COOKIE) is configured and valid.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 function okRpc(id: string | number | null | undefined, result: unknown): Response {
@@ -198,6 +235,24 @@ export async function handleHubMcp(
 
       const now = Math.floor(Date.now() / 1000);
       const signalCutoff = now - 72 * 3600;
+      let notionStatus: "ok" | "expired" | "unconfigured" = env.NOTION_COOKIE
+        ? "ok"
+        : "unconfigured";
+      let notionError: string | undefined;
+      let allNotionTasks: NotionTask[] = [];
+      if (env.NOTION_COOKIE) {
+        const notionRes = await listNotionTasks(
+          env,
+          { pageId, openOnly: true, limit: 100 },
+          fetchImpl,
+        );
+        if (notionRes.ok) {
+          allNotionTasks = notionRes.tasks;
+        } else {
+          notionStatus = "expired";
+          notionError = notionRes.error;
+        }
+      }
       const briefings = await Promise.all(
         pages.map(async (p) => {
           const [partners, topHooks, goldExamples, pending, signalsRes, latestSig] =
@@ -307,13 +362,21 @@ export async function handleHubMcp(
               created_at: d.created_at,
             })),
             active_partners: partners,
+            notion_tasks: allNotionTasks.filter((t) => t.page_id === p.page_id).slice(0, 15),
             top_hooks_14d: topHooks,
             gold_examples: goldExamples,
           };
         }),
       );
 
-      return okRpc(body.id, toolResult({ pages: briefings }));
+      return okRpc(
+        body.id,
+        toolResult({
+          notion_status: notionStatus,
+          ...(notionError ? { notion_error: notionError } : {}),
+          pages: briefings,
+        }),
+      );
     }
 
     if (name === "picker_rank") {
@@ -469,6 +532,39 @@ export async function handleHubMcp(
 
     if (name === "doomscroll_health") {
       const res = await getDoomscrollHealth(env, fetchImpl);
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_tasks") {
+      const res = await listNotionTasks(
+        env,
+        {
+          pageId: typeof args.page_id === "string" ? args.page_id : undefined,
+          channel: typeof args.channel === "string" ? args.channel : undefined,
+          status: typeof args.status === "string" ? args.status : undefined,
+          openOnly: args.open_only === undefined ? true : Boolean(args.open_only),
+          onlyWithComments: Boolean(args.only_with_comments),
+          limit: typeof args.limit === "number" ? args.limit : 100,
+        },
+        fetchImpl,
+      );
+      return okRpc(
+        body.id,
+        toolResult(res.ok ? { ok: true, count: res.tasks.length, tasks: res.tasks } : res, !res.ok),
+      );
+    }
+
+    if (name === "notion_page") {
+      const target = String(args.page_id ?? "");
+      if (!target) {
+        return okRpc(body.id, toolResult({ ok: false, error: "page_id is required" }, true));
+      }
+      const res = await getNotionPage(env, target, fetchImpl);
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_health") {
+      const res = await checkNotionHealth(env, fetchImpl);
       return okRpc(body.id, toolResult(res, !res.ok));
     }
 

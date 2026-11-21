@@ -6,6 +6,10 @@ export interface Env {
   XEFFECT_TOKEN?: string;
   PARTNER_SHEET_CSV_URL?: string;
   NOTION_TOKEN?: string;
+  NOTION_COOKIE?: string;
+  NOTION_SPACE_ID?: string;
+  NOTION_COLLECTION_ID?: string;
+  NOTION_VIEW_ID?: string;
 }
 
 export interface PageConfig {

@@ -11,6 +11,13 @@ import {
 } from "../src/doomscroll.ts";
 import { app } from "../src/index.ts";
 import { handleHubMcp } from "../src/mcp.ts";
+import {
+  buildNotionCookieHeader,
+  checkNotionHealth,
+  getNotionPage,
+  listNotionTasks,
+  normalizeNotionId,
+} from "../src/notion.ts";
 import { listActivePartners, syncPartnersFromCsv, upsertPartner } from "../src/partners.ts";
 import { rankProjectsForSeries, recordPickDecision } from "../src/picker.ts";
 import type { Env } from "../src/types.ts";
@@ -290,6 +297,9 @@ test("Hono routes and hubos MCP fail closed without token and serve core tools",
   expect(names).toContain("vibe_check");
   expect(names).toContain("doomscroll_sync");
   expect(names).toContain("doomscroll_health");
+  expect(names).toContain("notion_tasks");
+  expect(names).toContain("notion_page");
+  expect(names).toContain("notion_health");
 });
 
 test("all markdown and skill files in hubos contain zero em dashes", () => {
@@ -688,4 +698,187 @@ test("live integration helpers: SSE+TSV parsing, Host header, and partner CSV sy
   );
   expect(legacyHealth.ok).toBe(true);
   expect((legacyHealth.status as { mode?: string }).mode).toBe("xeffect-mcp-legacy");
+});
+
+test("notion v3 client: cookie parsing, health, tasks, page body/comments, and hub_briefing integration", async () => {
+  expect(buildNotionCookieHeader(undefined)).toBeNull();
+  expect(buildNotionCookieHeader("v03%3Aabc")).toBe("token_v2=v03%3Aabc");
+  expect(
+    buildNotionCookieHeader(
+      JSON.stringify([
+        { name: "token_v2", value: "v03%3Aabc" },
+        { name: "notion_user_id", value: "u-1" },
+      ]),
+    ),
+  ).toBe("token_v2=v03%3Aabc; notion_user_id=u-1");
+  expect(
+    normalizeNotionId("https://app.notion.com/p/hb2023/2c83c88d5f6980439847c5756117cd2d?v=abc"),
+  ).toBe("2c83c88d-5f69-8043-9847-c5756117cd2d");
+
+  const db = createMockD1();
+  const unconfigured = await checkNotionHealth({ DB: db });
+  expect(unconfigured.ok).toBe(false);
+  expect(unconfigured.cookie_status).toBe("unconfigured");
+
+  const notionFetch = (async (url: RequestInfo | URL) => {
+    const u = String(url);
+    if (u.endsWith("/getSpaces")) {
+      return new Response(
+        JSON.stringify({
+          "user-1": {
+            space: {
+              "835b528e-c5a8-4a45-896b-ff702fdbc807": { value: { name: "HB Block" } },
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (u.endsWith("/queryCollection")) {
+      return new Response(
+        JSON.stringify({
+          result: {
+            reducerResults: {
+              collection_group_results: {
+                blockIds: ["row-open", "row-posted"],
+              },
+            },
+          },
+          recordMap: {
+            collection: {
+              "2c83c88d-5f69-81c5-93d6-000b91d99eae": {
+                value: {
+                  schema: {
+                    title: { name: "Title", type: "title" },
+                    ch: { name: "Channel", type: "select" },
+                    st: { name: "Status", type: "status" },
+                    dt: { name: "Date", type: "date" },
+                    nt: { name: "Note", type: "text" },
+                  },
+                },
+              },
+            },
+            block: {
+              "row-open": {
+                value: {
+                  id: "row-open",
+                  last_edited_time: 1795200000000,
+                  discussions: ["disc-1"],
+                  properties: {
+                    title: [["State of Base Agents"]],
+                    ch: [["Base Hub"]],
+                    st: [["Done Content"]],
+                    dt: [["‣", [["d", { start_date: "2026-11-21" }]]]],
+                    nt: [["Check comment thread"]],
+                  },
+                },
+              },
+              "row-posted": {
+                value: {
+                  id: "row-posted",
+                  last_edited_time: 1795100000000,
+                  properties: {
+                    title: [["Already Posted Recap"]],
+                    ch: [["Base Hub"]],
+                    st: [["Posted"]],
+                  },
+                },
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (u.endsWith("/loadPageChunk")) {
+      return new Response(
+        JSON.stringify({
+          recordMap: {
+            block: {
+              "2c83c88d-5f69-8043-9847-c5756117cd2d": {
+                value: {
+                  id: "2c83c88d-5f69-8043-9847-c5756117cd2d",
+                  content: ["child-1"],
+                  properties: { title: [["State of Base Agents"]] },
+                },
+              },
+              "child-1": {
+                value: {
+                  id: "child-1",
+                  type: "bulleted_list",
+                  properties: { title: [["Include Aerodrome and Virtuals metrics."]] },
+                },
+              },
+            },
+            discussion: {
+              "disc-1": { value: { id: "disc-1", resolved: false } },
+            },
+            comment: {
+              "c-1": {
+                value: {
+                  id: "c-1",
+                  parent_id: "disc-1",
+                  text: [["Please double check TVL figures."]],
+                  created_time: 1795200000000,
+                  created_by_id: "user-2",
+                },
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response("not found", { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const env: Env = {
+    DB: db,
+    HUB_MCP_TOKEN: "hub-secret",
+    NOTION_COOKIE: "token_v2=test-cookie",
+  };
+
+  const health = await checkNotionHealth(env, notionFetch);
+  expect(health.ok).toBe(true);
+  expect(health.cookie_status).toBe("ok");
+
+  const tasks = await listNotionTasks(env, { pageId: "basehub", openOnly: true }, notionFetch);
+  expect(tasks.ok).toBe(true);
+  if (tasks.ok) {
+    expect(tasks.tasks).toHaveLength(1);
+    expect(tasks.tasks[0]?.title).toBe("State of Base Agents");
+    expect(tasks.tasks[0]?.page_id).toBe("basehub");
+    expect(tasks.tasks[0]?.date).toBe("2026-11-21");
+    expect(tasks.tasks[0]?.discussion_count).toBe(1);
+  }
+
+  const page = await getNotionPage(env, "2c83c88d5f6980439847c5756117cd2d", notionFetch);
+  expect(page.ok).toBe(true);
+  if (page.ok) {
+    expect(page.page.blocks).toHaveLength(1);
+    expect(page.page.comments).toHaveLength(1);
+    expect(page.page.comments[0]?.text).toContain("TVL figures");
+  }
+
+  const briefRes = await handleHubMcp(
+    new Request("https://hubos/mcp", {
+      method: "POST",
+      headers: { authorization: "Bearer hub-secret", "content-type": "application/json" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "tools/call",
+        params: { name: "hub_briefing", arguments: { page_id: "basehub" } },
+      }),
+    }),
+    env,
+    notionFetch,
+  );
+  const briefJson = (await briefRes.json()) as { result: { content: Array<{ text: string }> } };
+  const brief = JSON.parse(briefJson.result.content[0]?.text ?? "{}") as {
+    notion_status: string;
+    pages: Array<{ page_id: string; notion_tasks: Array<{ title: string }> }>;
+  };
+  expect(brief.notion_status).toBe("ok");
+  expect(brief.pages[0]?.notion_tasks[0]?.title).toBe("State of Base Agents");
 });
