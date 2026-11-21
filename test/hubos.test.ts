@@ -751,7 +751,18 @@ test("notion v3 client: cookie parsing, health, tasks, page body/comments, and h
                   schema: {
                     title: { name: "Title", type: "title" },
                     ch: { name: "Channel", type: "select" },
-                    st: { name: "Status", type: "status" },
+                    st: {
+                      name: "Status",
+                      type: "status",
+                      options: [
+                        { id: "opt-1", value: "Done Content" },
+                        { id: "opt-2", value: "Posted" },
+                      ],
+                      groups: [
+                        { id: "grp-1", name: "In progress", optionIds: ["opt-1"] },
+                        { id: "grp-2", name: "Complete", optionIds: ["opt-2"] },
+                      ],
+                    },
                     dt: { name: "Date", type: "date" },
                     nt: { name: "Note", type: "text" },
                   },
@@ -847,8 +858,9 @@ test("notion v3 client: cookie parsing, health, tasks, page body/comments, and h
   if (tasks.ok) {
     expect(tasks.tasks).toHaveLength(1);
     expect(tasks.tasks[0]?.title).toBe("State of Base Agents");
-    expect(tasks.tasks[0]?.page_id).toBe("basehub");
-    expect(tasks.tasks[0]?.date).toBe("2026-11-21");
+    expect(tasks.tasks[0]?.properties.Channel).toBe("Base Hub");
+    expect(tasks.tasks[0]?.properties.Date).toBe("2026-11-21");
+    expect(tasks.tasks[0]?.status_group).toBe("In progress");
     expect(tasks.tasks[0]?.discussion_count).toBe(1);
   }
 
@@ -881,4 +893,243 @@ test("notion v3 client: cookie parsing, health, tasks, page body/comments, and h
   };
   expect(brief.notion_status).toBe("ok");
   expect(brief.pages[0]?.notion_tasks[0]?.title).toBe("State of Base Agents");
+});
+
+test("Notion v3 root write tools execute directly with no approval gate", async () => {
+  const db = createMockD1();
+  const capturedOps: Array<{ path: string; body: Record<string, unknown> }> = [];
+  const pageId = "2c83c88d-5f69-8043-9847-c5756117cd2d";
+  const colId = "2c83c88d-5f69-81c5-93d6-000b91d99eae";
+
+  const mockFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url =
+      typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+    const path = url.split("/api/v3/")[1] ?? "";
+    const parsed = init?.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+    capturedOps.push({ path, body: parsed });
+
+    if (path === "syncRecordValues") {
+      return new Response(
+        JSON.stringify({
+          recordMap: {
+            collection: {
+              [colId]: {
+                value: {
+                  schema: {
+                    "{XpB": { name: "Channel", type: "select" },
+                    ":vF}": { name: "Status", type: "status" },
+                    "[A?a": { name: "Type", type: "multi_select" },
+                    "HR;A": { name: "Priority", type: "select" },
+                    "l{?I": { name: "Date", type: "date" },
+                    F_pz: { name: "Note ", type: "text" },
+                    ":_ZW": { name: "Result (X Link) ", type: "url" },
+                    "I:\\;": { name: "Visual link", type: "url" },
+                    newCol: { name: "Custom Flag", type: "checkbox" },
+                  },
+                },
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (path === "loadPageChunk") {
+      return new Response(
+        JSON.stringify({
+          recordMap: {
+            block: {
+              [pageId]: {
+                value: {
+                  id: pageId,
+                  type: "page",
+                  properties: { title: [["Old Card"]] },
+                  content: ["old-blk-1"],
+                },
+              },
+              "old-blk-1": {
+                value: {
+                  id: "old-blk-1",
+                  type: "text",
+                  properties: { title: [["Old paragraph"]] },
+                },
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (path === "getSpaces") {
+      return new Response(
+        JSON.stringify({ "11111111-1111-1111-1111-111111111111": { space: {} } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    if (path === "saveTransactionsFanout") {
+      return new Response(JSON.stringify({}), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    return new Response("not found", { status: 404 });
+  }) as unknown as typeof fetch;
+
+  const env: Env = {
+    DB: db,
+    HUB_MCP_TOKEN: "hub-secret",
+    NOTION_COOKIE: "token_v2=test-cookie",
+  };
+
+  const callTool = async (name: string, args: Record<string, unknown>) => {
+    const res = await handleHubMcp(
+      new Request("https://hubos/mcp", {
+        method: "POST",
+        headers: { authorization: "Bearer hub-secret", "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "tools/call",
+          params: { name, arguments: args },
+        }),
+      }),
+      env,
+      mockFetch,
+    );
+    const json = (await res.json()) as {
+      result: { isError: boolean; content: Array<{ text: string }> };
+    };
+    return {
+      isError: json.result.isError,
+      data: JSON.parse(json.result.content[0]?.text ?? "{}") as Record<string, unknown>,
+    };
+  };
+
+  // Verify tools/list exposes all 7 root write tools with no approval parameter
+  const listRes = await handleHubMcp(
+    new Request("https://hubos/mcp", {
+      method: "POST",
+      headers: { authorization: "Bearer hub-secret", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 0, method: "tools/list" }),
+    }),
+    env,
+    mockFetch,
+  );
+  const listJson = (await listRes.json()) as {
+    result: {
+      tools: Array<{ name: string; inputSchema: { properties?: Record<string, unknown> } }>;
+    };
+  };
+  const writeToolNames = [
+    "notion_schema",
+    "notion_search",
+    "notion_create_task",
+    "notion_update_task",
+    "notion_append_blocks",
+    "notion_replace_blocks",
+    "notion_update_block",
+    "notion_comment",
+    "notion_archive_task",
+  ];
+  for (const toolName of writeToolNames) {
+    const found = listJson.result.tools.find((t) => t.name === toolName);
+    expect(found).toBeDefined();
+    expect(found?.inputSchema.properties?.approved).toBeUndefined();
+  }
+
+  // 0. Discover live schema (including newly added custom columns)
+  const schemaRes = await callTool("notion_schema", {});
+  expect(schemaRes.isError).toBe(false);
+  expect(schemaRes.data.ok).toBe(true);
+
+  // 1. Create task with dynamic properties (no hardcoded mappings) + markdown body
+  const created = await callTool("notion_create_task", {
+    title: "Base Daily Recap",
+    properties: {
+      Channel: "Brand New Page",
+      Status: "Brand New Status",
+      Type: ["Recap", "Insights"],
+      Date: "2026-11-22",
+      "Custom Flag": true,
+    },
+    markdown: "# Hook\n- Bullet one\n---",
+  });
+  expect(created.isError).toBe(false);
+  expect(created.data.ok).toBe(true);
+  expect((created.data.added_block_ids as string[]).length).toBe(3);
+
+  // 2. Update task using arbitrary live property names
+  const updated = await callTool("notion_update_task", {
+    page_id: pageId,
+    properties: {
+      Status: "Brand New Status",
+      Note: "Ready for visual",
+      "Result (X Link)": "https://x.com/basehub/status/123",
+      "Custom Flag": false,
+    },
+  });
+  expect(updated.isError).toBe(false);
+  expect(updated.data.updated_fields).toEqual([
+    "Status",
+    "Note ",
+    "Result (X Link) ",
+    "Custom Flag",
+  ]);
+
+  // 3. Append blocks
+  const appended = await callTool("notion_append_blocks", {
+    page_id: pageId,
+    markdown: "## Draft\nLine 1\n- Item A",
+  });
+  expect(appended.isError).toBe(false);
+  expect((appended.data.added_block_ids as string[]).length).toBe(3);
+
+  // 4. Replace blocks
+  const replaced = await callTool("notion_replace_blocks", {
+    page_id: pageId,
+    markdown: "Fresh single paragraph",
+  });
+  expect(replaced.isError).toBe(false);
+  expect(replaced.data.removed_block_ids).toEqual(["old-blk-1"]);
+  expect((replaced.data.added_block_ids as string[]).length).toBe(1);
+
+  // 5. Update single block
+  const blkUpdated = await callTool("notion_update_block", {
+    block_id: "old-blk-1",
+    text: "Edited line",
+  });
+  expect(blkUpdated.isError).toBe(false);
+  expect(blkUpdated.data.ok).toBe(true);
+
+  // 6. Comment & resolve
+  const commented = await callTool("notion_comment", {
+    page_id: pageId,
+    text: "Draft updated and marked Done Content",
+  });
+  expect(commented.isError).toBe(false);
+  expect(typeof commented.data.discussion_id).toBe("string");
+  const resolved = await callTool("notion_comment", {
+    discussion_id: String(commented.data.discussion_id),
+    resolve: true,
+  });
+  expect(resolved.isError).toBe(false);
+  expect(resolved.data.resolved).toBe(true);
+
+  // 7. Archive & restore
+  const archived = await callTool("notion_archive_task", { page_id: pageId, archive: true });
+  expect(archived.isError).toBe(false);
+  expect(archived.data.archived).toBe(true);
+
+  // Verify saveTransactionsFanout calls were issued and non-title properties use updateBlockPropertyValue
+  const txCalls = capturedOps.filter((c) => c.path === "saveTransactionsFanout");
+  expect(txCalls.length).toBe(8);
+  const allOps = txCalls.flatMap((c) => {
+    const txs =
+      (c.body.transactions as Array<{ operations?: Array<Record<string, unknown>> }>) ?? [];
+    return txs.flatMap((t) => t.operations ?? []);
+  });
+  const hlops = allOps.filter((op) => op.command === "updateBlockPropertyValue");
+  expect(hlops.length).toBe(2);
+  expect(hlops[0]?.path).toEqual(["properties"]);
+  expect(hlops[1]?.path).toEqual(["properties"]);
 });

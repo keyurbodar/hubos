@@ -1,6 +1,21 @@
 import { getDoomscrollHealth, syncDoomscroll } from "./doomscroll.ts";
 import { getGoldExamples, getRecentHooks, getTopPerformingHooks } from "./metrics.ts";
-import { checkNotionHealth, getNotionPage, listNotionTasks, type NotionTask } from "./notion.ts";
+import {
+  appendNotionBlocks,
+  archiveNotionTask,
+  checkNotionHealth,
+  commentOnNotionPage,
+  createNotionTask,
+  getNotionPage,
+  getNotionSchema,
+  listNotionTasks,
+  type NotionBlockInput,
+  type NotionTask,
+  replaceNotionBlocks,
+  searchNotion,
+  updateNotionBlock,
+  updateNotionTask,
+} from "./notion.ts";
 import { listActivePartners, syncPartnersFromCsv, upsertPartner } from "./partners.ts";
 import { rankProjectsForSeries, recordPickDecision } from "./picker.ts";
 import type { Env, PageConfig } from "./types.ts";
@@ -137,28 +152,67 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
   },
   {
+    name: "notion_schema",
+    description:
+      "Inspect the live Notion database schema (all columns, types, status groups, and select/multi_select options). Call this whenever you need current column names or valid options; never assume fixed statuses or mappings.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        board_page_id: {
+          type: "string",
+          description:
+            "Optional Notion database/board page ID or URL to inspect instead of default",
+        },
+        collection_id: { type: "string", description: "Optional Notion collection ID" },
+        space_id: { type: "string", description: "Optional Notion space ID" },
+      },
+    },
+  },
+  {
+    name: "notion_search",
+    description:
+      "Search across the Notion workspace for any page, database, or card (useful when new pages or boards are added).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        space_id: { type: "string" },
+        limit: { type: "number", default: 20 },
+      },
+      required: ["query"],
+    },
+  },
+  {
     name: "notion_tasks",
     description:
-      "Read-only query of HB Block Notion tasks from the Partner content database. Filter by page_id, channel, status, open_only, or only_with_comments.",
+      "Query Notion tasks/rows dynamically from the live database schema. Filter by status, channel, search text, arbitrary column filters, open_only, or only_with_comments. Works on any database via optional collection_id/view_id/space_id.",
     inputSchema: {
       type: "object",
       properties: {
         page_id: {
           type: "string",
-          enum: ["basehub", "aionbase", "robinhub", "robinhoodhub", "elysiumhub"],
+          description: "Optional fuzzy match against any text property (e.g. page/channel name)",
         },
         channel: { type: "string" },
         status: { type: "string" },
+        search: { type: "string", description: "Substring search across title and properties" },
+        filters: {
+          type: "object",
+          description: "Arbitrary map of column name (or key) -> expected value or array of values",
+        },
         open_only: { type: "boolean", default: true },
         only_with_comments: { type: "boolean", default: false },
         limit: { type: "number", default: 100 },
+        collection_id: { type: "string" },
+        view_id: { type: "string" },
+        space_id: { type: "string" },
       },
     },
   },
   {
     name: "notion_page",
     description:
-      "Read-only fetch of a Notion task page body blocks and all discussion comments (accepts page ID or Notion URL).",
+      "Fetch any Notion page's live decoded properties, body blocks, and discussion comments (accepts page ID or Notion URL).",
     inputSchema: {
       type: "object",
       properties: {
@@ -171,6 +225,159 @@ const TOOLS = [
     name: "notion_health",
     description: "Check whether the Notion session cookie (NOTION_COOKIE) is configured and valid.",
     inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "notion_create_task",
+    description:
+      "Create a new card/row in any Notion database using live schema column names (or raw property keys) and optional Markdown/block content. Executes immediately with no approval gate.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        properties: {
+          type: "object",
+          description:
+            "Map of live Notion column name (e.g. Status, Channel, Priority, Date, Type, Note, or any newly added column) -> value. Call notion_schema to see all columns and options.",
+        },
+        markdown: { type: "string", description: "Optional initial page body in Markdown" },
+        blocks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string" },
+              text: { type: "string" },
+              checked: { type: "boolean" },
+            },
+          },
+        },
+        collection_id: { type: "string" },
+        space_id: { type: "string" },
+      },
+      required: ["title"],
+    },
+  },
+  {
+    name: "notion_update_task",
+    description:
+      "Update title and/or any properties on an existing Notion card/page by live column name or property key (automatically resolves the page's parent database schema; pass null to clear a field). Executes immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string", description: "Notion page ID or URL" },
+        title: { type: "string" },
+        properties: {
+          type: "object",
+          description:
+            "Map of live column name or key -> value (or null to clear). Works with any existing or newly added column/status.",
+        },
+        collection_id: { type: "string" },
+        space_id: { type: "string" },
+      },
+      required: ["page_id"],
+    },
+  },
+  {
+    name: "notion_append_blocks",
+    description:
+      "Append Markdown or structured blocks to any Notion page body (optionally after a specific block ID). Executes immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string", description: "Notion page ID or URL" },
+        markdown: { type: "string" },
+        blocks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string" },
+              text: { type: "string" },
+              checked: { type: "boolean" },
+            },
+          },
+        },
+        after_block_id: { type: "string" },
+        space_id: { type: "string" },
+      },
+      required: ["page_id"],
+    },
+  },
+  {
+    name: "notion_replace_blocks",
+    description:
+      "Replace all child content blocks on a Notion page with new Markdown or structured blocks in one atomic transaction. Executes immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string", description: "Notion page ID or URL" },
+        markdown: { type: "string" },
+        blocks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              type: { type: "string" },
+              text: { type: "string" },
+              checked: { type: "boolean" },
+            },
+          },
+        },
+        space_id: { type: "string" },
+      },
+      required: ["page_id"],
+    },
+  },
+  {
+    name: "notion_update_block",
+    description:
+      "Update a single Notion block's text, type, or alive flag (set alive=false to delete a block). Executes immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        block_id: { type: "string" },
+        text: { type: "string" },
+        type: { type: "string" },
+        alive: { type: "boolean" },
+        space_id: { type: "string" },
+      },
+      required: ["block_id"],
+    },
+  },
+  {
+    name: "notion_comment",
+    description:
+      "Create a new comment thread on a Notion page, reply to an existing discussion_id, or resolve/reopen a discussion. Executes immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string", description: "Required when starting a new comment thread" },
+        discussion_id: {
+          type: "string",
+          description: "Existing discussion ID to reply to or resolve",
+        },
+        text: { type: "string" },
+        resolve: {
+          type: "boolean",
+          description: "Set true to resolve or false to reopen discussion_id",
+        },
+        space_id: { type: "string" },
+      },
+    },
+  },
+  {
+    name: "notion_archive_task",
+    description:
+      "Archive (or restore with archive=false) a Notion task card/page. Executes immediately.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        page_id: { type: "string", description: "Notion page ID or URL" },
+        archive: { type: "boolean", default: true },
+        space_id: { type: "string" },
+      },
+      required: ["page_id"],
+    },
   },
 ];
 
@@ -362,7 +569,17 @@ export async function handleHubMcp(
               created_at: d.created_at,
             })),
             active_partners: partners,
-            notion_tasks: allNotionTasks.filter((t) => t.page_id === p.page_id).slice(0, 15),
+            notion_tasks: allNotionTasks
+              .filter((t) => {
+                const wantId = p.page_id.toLowerCase().replace(/[^a-z0-9]/g, "");
+                const wantName = p.name.toLowerCase().replace(/[^a-z0-9]/g, "");
+                return Object.values(t.properties).some((v) => {
+                  if (typeof v !== "string") return false;
+                  const norm = v.toLowerCase().replace(/[^a-z0-9]/g, "");
+                  return norm === wantId || norm === wantName || norm.includes(wantId);
+                });
+              })
+              .slice(0, 15),
             top_hooks_14d: topHooks,
             gold_examples: goldExamples,
           };
@@ -535,6 +752,36 @@ export async function handleHubMcp(
       return okRpc(body.id, toolResult(res, !res.ok));
     }
 
+    if (name === "notion_schema") {
+      const res = await getNotionSchema(
+        env,
+        {
+          boardPageId: typeof args.board_page_id === "string" ? args.board_page_id : undefined,
+          collectionId: typeof args.collection_id === "string" ? args.collection_id : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_search") {
+      const query = typeof args.query === "string" ? args.query.trim() : "";
+      if (!query) {
+        return okRpc(body.id, toolResult({ ok: false, error: "query is required" }, true));
+      }
+      const res = await searchNotion(
+        env,
+        {
+          query,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+          limit: typeof args.limit === "number" ? args.limit : 20,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
     if (name === "notion_tasks") {
       const res = await listNotionTasks(
         env,
@@ -542,15 +789,28 @@ export async function handleHubMcp(
           pageId: typeof args.page_id === "string" ? args.page_id : undefined,
           channel: typeof args.channel === "string" ? args.channel : undefined,
           status: typeof args.status === "string" ? args.status : undefined,
+          search: typeof args.search === "string" ? args.search : undefined,
+          filters:
+            args.filters && typeof args.filters === "object"
+              ? (args.filters as Record<string, string | string[]>)
+              : undefined,
           openOnly: args.open_only === undefined ? true : Boolean(args.open_only),
           onlyWithComments: Boolean(args.only_with_comments),
           limit: typeof args.limit === "number" ? args.limit : 100,
+          collectionId: typeof args.collection_id === "string" ? args.collection_id : undefined,
+          viewId: typeof args.view_id === "string" ? args.view_id : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
         },
         fetchImpl,
       );
       return okRpc(
         body.id,
-        toolResult(res.ok ? { ok: true, count: res.tasks.length, tasks: res.tasks } : res, !res.ok),
+        toolResult(
+          res.ok
+            ? { ok: true, schema: res.schema, count: res.tasks.length, tasks: res.tasks }
+            : res,
+          !res.ok,
+        ),
       );
     }
 
@@ -565,6 +825,139 @@ export async function handleHubMcp(
 
     if (name === "notion_health") {
       const res = await checkNotionHealth(env, fetchImpl);
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_create_task") {
+      const title = typeof args.title === "string" ? args.title.trim() : "";
+      if (!title) {
+        return okRpc(body.id, toolResult({ ok: false, error: "title is required" }, true));
+      }
+      const res = await createNotionTask(
+        env,
+        {
+          title,
+          properties:
+            args.properties && typeof args.properties === "object"
+              ? (args.properties as Record<string, unknown>)
+              : undefined,
+          markdown: typeof args.markdown === "string" ? args.markdown : undefined,
+          blocks: Array.isArray(args.blocks) ? (args.blocks as NotionBlockInput[]) : undefined,
+          collectionId: typeof args.collection_id === "string" ? args.collection_id : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_update_task") {
+      const target = typeof args.page_id === "string" ? args.page_id.trim() : "";
+      if (!target) {
+        return okRpc(body.id, toolResult({ ok: false, error: "page_id is required" }, true));
+      }
+      const res = await updateNotionTask(
+        env,
+        {
+          pageId: target,
+          title: typeof args.title === "string" ? args.title : undefined,
+          properties:
+            args.properties && typeof args.properties === "object"
+              ? (args.properties as Record<string, unknown>)
+              : undefined,
+          collectionId: typeof args.collection_id === "string" ? args.collection_id : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_append_blocks") {
+      const target = typeof args.page_id === "string" ? args.page_id.trim() : "";
+      if (!target) {
+        return okRpc(body.id, toolResult({ ok: false, error: "page_id is required" }, true));
+      }
+      const res = await appendNotionBlocks(
+        env,
+        {
+          pageId: target,
+          markdown: typeof args.markdown === "string" ? args.markdown : undefined,
+          blocks: Array.isArray(args.blocks) ? (args.blocks as NotionBlockInput[]) : undefined,
+          afterBlockId: typeof args.after_block_id === "string" ? args.after_block_id : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_replace_blocks") {
+      const target = typeof args.page_id === "string" ? args.page_id.trim() : "";
+      if (!target) {
+        return okRpc(body.id, toolResult({ ok: false, error: "page_id is required" }, true));
+      }
+      const res = await replaceNotionBlocks(
+        env,
+        {
+          pageId: target,
+          markdown: typeof args.markdown === "string" ? args.markdown : undefined,
+          blocks: Array.isArray(args.blocks) ? (args.blocks as NotionBlockInput[]) : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_update_block") {
+      const target = typeof args.block_id === "string" ? args.block_id.trim() : "";
+      if (!target) {
+        return okRpc(body.id, toolResult({ ok: false, error: "block_id is required" }, true));
+      }
+      const res = await updateNotionBlock(
+        env,
+        {
+          blockId: target,
+          text: typeof args.text === "string" ? args.text : undefined,
+          type: typeof args.type === "string" ? args.type : undefined,
+          alive: typeof args.alive === "boolean" ? args.alive : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_comment") {
+      const res = await commentOnNotionPage(
+        env,
+        {
+          pageId: typeof args.page_id === "string" ? args.page_id : undefined,
+          discussionId: typeof args.discussion_id === "string" ? args.discussion_id : undefined,
+          text: typeof args.text === "string" ? args.text : undefined,
+          resolve: typeof args.resolve === "boolean" ? args.resolve : undefined,
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
+      return okRpc(body.id, toolResult(res, !res.ok));
+    }
+
+    if (name === "notion_archive_task") {
+      const target = typeof args.page_id === "string" ? args.page_id.trim() : "";
+      if (!target) {
+        return okRpc(body.id, toolResult({ ok: false, error: "page_id is required" }, true));
+      }
+      const res = await archiveNotionTask(
+        env,
+        {
+          pageId: target,
+          archive: args.archive === undefined ? true : Boolean(args.archive),
+          spaceId: typeof args.space_id === "string" ? args.space_id : undefined,
+        },
+        fetchImpl,
+      );
       return okRpc(body.id, toolResult(res, !res.ok));
     }
 
