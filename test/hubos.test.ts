@@ -563,4 +563,68 @@ test("live integration helpers: SSE+TSV parsing, Host header, and partner CSV sy
   expect(afterResync?.deliverable).toBe("2 spotlight threads");
   expect(afterResync?.due_date).toBe("2026-11-28");
   expect(afterResync?.brief_url).toBe("https://notion.so/uptopia-brief");
+
+  // Partial legacy batch failure reports ok=false and preserves failed batch project stats
+  const partialDb = createMockD1();
+  const nowSec = Math.floor(Date.now() / 1000);
+  for (let i = 0; i < 21; i += 1) {
+    await partialDb
+      .prepare(
+        `INSERT INTO projects (handle, name, ecosystem, pages_json, category, tier, followers_count, posts_7d, posts_30d, avg_eng_7d, cross_mentions_72h, active, updated_at)
+         VALUES (?, ?, 'base', '["basehub"]', 'app', 2, 1000, 9, 12, 50, 0, 1, ?)`,
+      )
+      .bind(`proj${i}`, `Proj ${i}`, nowSec)
+      .run();
+  }
+  let legacyBatchCall = 0;
+  const partialFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as {
+      params?: { arguments?: { accounts?: string[]; targets?: Array<{ handle: string }> } };
+    };
+    if (body.params?.arguments?.accounts) {
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          error: { code: -32602, message: "targets required" },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    legacyBatchCall += 1;
+    if (legacyBatchCall === 1) {
+      const batchTsv = [
+        "#OK ok=1 err=0 ms=10 posts=1",
+        "id\t@user\ttime\tkind\tthread\ttext\timages\tlinks\tquote\tlikes\treplies\treposts\tquotes\tbookmarks\tviews\turl\tquote_url\tretweeted_by\treply_to",
+        `p0\t@proj0\t2026-11-20T10:00:00Z\tpost\t-\tShipped mainnet\t-\t-\t-\t5\t0\t1\t0\t2\t100\thttps://x.com/proj0/status/p0\t-\t-\t-`,
+      ].join("\n");
+      return new Response(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { content: [{ type: "text", text: batchTsv }] },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response("upstream down", { status: 400 });
+  }) as unknown as typeof fetch;
+
+  const partialSync = await syncDoomscroll(
+    {
+      DB: partialDb,
+      XEFFECT_URL: "https://xeffect.example.workers.dev/mcp",
+      XEFFECT_TOKEN: "tok",
+    },
+    { ecosystem: "base", hours: 72, fetchImpl: partialFetch },
+  );
+  expect(partialSync.ok).toBe(false);
+  expect(partialSync.error).toContain("HTTP 400");
+  expect(partialSync.signals_upserted).toBe(1);
+  expect(partialSync.projects_updated).toBe(20);
+  const untouched = await partialDb
+    .prepare("SELECT posts_7d, posts_30d FROM projects WHERE handle = 'proj20'")
+    .first<{ posts_7d: number; posts_30d: number }>();
+  expect(untouched?.posts_7d).toBe(9);
+  expect(untouched?.posts_30d).toBe(12);
 });

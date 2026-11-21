@@ -302,6 +302,8 @@ export async function syncDoomscroll(
   const handles = projects.map((p) => p.handle);
 
   let posts: XeffectPost[] = [];
+  const syncedHandles = new Set<string>();
+  const batchErrors: string[] = [];
   const postsRes = await callXeffectTool<{ posts?: XeffectPost[] }>(
     env,
     "posts",
@@ -310,10 +312,10 @@ export async function syncDoomscroll(
   );
   if (postsRes.ok) {
     posts = postsRes.data?.posts ?? [];
+    for (const h of handles) syncedHandles.add(h.toLowerCase());
   } else if (postsRes.error && /targets|invalid_type|required/i.test(postsRes.error)) {
     // Legacy xeffect `posts` schema: `{ targets: [{ handle, since, last }] }` (max 50 per call)
     const chunkSize = 20;
-    const errors: string[] = [];
     for (let i = 0; i < handles.length; i += chunkSize) {
       const batch = handles.slice(i, i + chunkSize);
       const batchRes = await callXeffectTool<{ posts?: XeffectPost[] }>(
@@ -324,14 +326,17 @@ export async function syncDoomscroll(
         },
         opts.fetchImpl,
       );
-      if (batchRes.ok && batchRes.data?.posts) {
-        posts.push(...batchRes.data.posts);
-      } else if (batchRes.error) {
-        errors.push(batchRes.error);
+      if (batchRes.ok) {
+        if (batchRes.data?.posts) {
+          posts.push(...batchRes.data.posts);
+        }
+        for (const h of batch) syncedHandles.add(h.toLowerCase());
+      } else {
+        batchErrors.push(batchRes.error ?? "xeffect batch failed");
       }
     }
-    if (posts.length === 0 && errors.length > 0) {
-      return { ok: false, signals_upserted: 0, projects_updated: 0, error: errors[0] };
+    if (syncedHandles.size === 0 && batchErrors.length > 0) {
+      return { ok: false, signals_upserted: 0, projects_updated: 0, error: batchErrors.join("; ") };
     }
   } else {
     return { ok: false, signals_upserted: 0, projects_updated: 0, error: postsRes.error };
@@ -439,7 +444,9 @@ export async function syncDoomscroll(
 
   let updated = 0;
   for (const p of projects) {
-    const stats = statsByHandle.get(p.handle.toLowerCase()) ?? {
+    const h = p.handle.toLowerCase();
+    if (!syncedHandles.has(h)) continue;
+    const stats = statsByHandle.get(h) ?? {
       posts30d: 0,
       posts7d: 0,
       engSum7d: 0,
@@ -456,5 +463,13 @@ export async function syncDoomscroll(
     updated += 1;
   }
 
+  if (batchErrors.length > 0) {
+    return {
+      ok: false,
+      signals_upserted: upserted,
+      projects_updated: updated,
+      error: batchErrors.join("; "),
+    };
+  }
   return { ok: true, signals_upserted: upserted, projects_updated: updated };
 }
