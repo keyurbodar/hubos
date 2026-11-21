@@ -74,6 +74,42 @@ function pagesForSection(section: string): string[] {
   return [];
 }
 
+async function syncCsvPartnerRow(
+  db: D1Database,
+  partner: {
+    partner_id: string;
+    name: string;
+    handle: string;
+    pages: string[];
+    deliverable: string;
+    brief_url: string | null;
+    status: string;
+  },
+): Promise<void> {
+  const now = Math.floor(Date.now() / 1000);
+  await db
+    .prepare(`
+      INSERT INTO partners (partner_id, name, handle, pages_json, deliverable, due_date, brief_url, status, updated_at)
+      VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)
+      ON CONFLICT(partner_id) DO UPDATE SET
+        pages_json = excluded.pages_json,
+        status = excluded.status,
+        brief_url = COALESCE(partners.brief_url, excluded.brief_url),
+        updated_at = excluded.updated_at
+    `)
+    .bind(
+      partner.partner_id,
+      partner.name,
+      partner.handle.replace(/^@+/, "").toLowerCase(),
+      JSON.stringify(partner.pages),
+      partner.deliverable,
+      partner.brief_url,
+      partner.status,
+      now,
+    )
+    .run();
+}
+
 /**
  * Parse and sync the Hub partner sheet CSV (sections: Base, Robinhood, Elysium).
  */
@@ -106,7 +142,7 @@ export async function syncPartnersFromCsv(
       const blacklistHandle = extractXHandle(cols[4]);
 
       if (activeHandle) {
-        await upsertPartner(db, {
+        await syncCsvPartnerRow(db, {
           partner_id: `${currentSection.toLowerCase()}_${activeHandle}`,
           name: activeHandle,
           handle: activeHandle,
@@ -118,7 +154,7 @@ export async function syncPartnersFromCsv(
         synced += 1;
       }
       if (expiredHandle) {
-        await upsertPartner(db, {
+        await syncCsvPartnerRow(db, {
           partner_id: `${currentSection.toLowerCase()}_${expiredHandle}`,
           name: expiredHandle,
           handle: expiredHandle,
@@ -130,7 +166,7 @@ export async function syncPartnersFromCsv(
         synced += 1;
       }
       if (blacklistHandle) {
-        await upsertPartner(db, {
+        await syncCsvPartnerRow(db, {
           partner_id: `${currentSection.toLowerCase()}_${blacklistHandle}`,
           name: blacklistHandle,
           handle: blacklistHandle,

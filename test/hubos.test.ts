@@ -10,7 +10,7 @@ import {
 } from "../src/doomscroll.ts";
 import { app } from "../src/index.ts";
 import { handleHubMcp } from "../src/mcp.ts";
-import { listActivePartners, syncPartnersFromCsv } from "../src/partners.ts";
+import { listActivePartners, syncPartnersFromCsv, upsertPartner } from "../src/partners.ts";
 import { rankProjectsForSeries, recordPickDecision } from "../src/picker.ts";
 import type { Env } from "../src/types.ts";
 import { runVibeCheck } from "../src/vibe-check.ts";
@@ -544,4 +544,23 @@ test("live integration helpers: SSE+TSV parsing, Host header, and partner CSV sy
   expect(activeBase.map((p) => p.handle)).toEqual(["uptopia_xyz"]);
   const activeRh = await listActivePartners(db, "robinhub");
   expect(activeRh.map((p) => p.handle)).toEqual(["dogestaronrh"]);
+
+  // Custom obligations survive subsequent CSV syncs
+  await upsertPartner(db, {
+    partner_id: "base_uptopia_xyz",
+    name: "Uptopia",
+    handle: "uptopia_xyz",
+    pages: ["basehub", "aionbase"],
+    deliverable: "2 spotlight threads",
+    due_date: "2026-11-28",
+    brief_url: "https://notion.so/uptopia-brief",
+    status: "active",
+  });
+  await syncPartnersFromCsv(db, "https://sheets.example/partners.csv", csvFetch);
+  const afterResync = (await listActivePartners(db, "basehub")).find(
+    (p) => p.partner_id === "base_uptopia_xyz",
+  );
+  expect(afterResync?.deliverable).toBe("2 spotlight threads");
+  expect(afterResync?.due_date).toBe("2026-11-28");
+  expect(afterResync?.brief_url).toBe("https://notion.so/uptopia-brief");
 });
