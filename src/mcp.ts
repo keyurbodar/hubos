@@ -388,8 +388,7 @@ export async function handleHubMcp(
       const now = Math.floor(Date.now() / 1000);
       const status = args.status === "rejected" ? "rejected" : "approved";
       const editedBody = typeof args.edited_body === "string" ? args.edited_body : null;
-      const isGold =
-        status === "approved" && (args.save_as_gold !== false || Boolean(editedBody)) ? 1 : 0;
+      const isGold = status === "approved" && args.save_as_gold !== false ? 1 : 0;
       await env.DB.prepare(
         "UPDATE drafts SET status = ?, edited_body = COALESCE(?, edited_body), is_gold_example = ?, decided_at = ? WHERE draft_id = ?",
       )
