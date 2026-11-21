@@ -202,7 +202,7 @@ export async function rankProjectsForSeries(
 
     const histRes = await db
       .prepare(
-        "SELECT page_id, series, decision, outcome_delta, created_at FROM selection_history WHERE handle = ? ORDER BY created_at DESC LIMIT 30",
+        "SELECT page_id, series, decision, outcome_delta, created_at FROM selection_history WHERE handle = ? AND decision IN ('approved', 'skipped') ORDER BY created_at DESC LIMIT 100",
       )
       .bind(project.handle)
       .all<{
