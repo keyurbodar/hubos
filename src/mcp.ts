@@ -226,13 +226,25 @@ export async function handleHubMcp(
                   created_at: number;
                 }>(),
               env.DB.prepare(
-                `SELECT signal_id, handle, text, source_url, created_at, likes, reposts, bookmarks, views, ship_score, ship_tags_json
-                 FROM signals
-                 WHERE ecosystem = ? AND created_at >= ?
-                 ORDER BY ship_score DESC, created_at DESC
+                `SELECT s.signal_id, s.handle, s.text, s.source_url, s.created_at, s.likes, s.reposts, s.bookmarks, s.views, s.ship_score, s.ship_tags_json
+                 FROM signals s
+                 LEFT JOIN projects pr ON pr.handle = s.handle AND pr.active = 1
+                 WHERE s.created_at >= ?
+                   AND (
+                     s.ecosystem = ?
+                     OR (
+                       pr.handle IS NOT NULL
+                       AND EXISTS (
+                         SELECT 1
+                         FROM json_each(COALESCE(NULLIF(pr.pages_json, ''), '[]'))
+                         WHERE value = ?
+                       )
+                     )
+                   )
+                 ORDER BY s.ship_score DESC, s.created_at DESC
                  LIMIT 15`,
               )
-                .bind(p.ecosystem, signalCutoff)
+                .bind(signalCutoff, p.ecosystem, p.page_id)
                 .all<{
                   signal_id: string;
                   handle: string;
@@ -246,8 +258,21 @@ export async function handleHubMcp(
                   ship_score: number;
                   ship_tags_json: string;
                 }>(),
-              env.DB.prepare("SELECT MAX(created_at) as latest FROM signals WHERE ecosystem = ?")
-                .bind(p.ecosystem)
+              env.DB.prepare(
+                `SELECT MAX(s.created_at) as latest
+                 FROM signals s
+                 LEFT JOIN projects pr ON pr.handle = s.handle AND pr.active = 1
+                 WHERE s.ecosystem = ?
+                   OR (
+                     pr.handle IS NOT NULL
+                     AND EXISTS (
+                       SELECT 1
+                       FROM json_each(COALESCE(NULLIF(pr.pages_json, ''), '[]'))
+                       WHERE value = ?
+                     )
+                   )`,
+              )
+                .bind(p.ecosystem, p.page_id)
                 .first<{ latest: number | null }>(),
             ]);
           return {

@@ -350,7 +350,7 @@ test("review regressions: briefings, drafts, gold opt-out, windowed doomscroll, 
   await db
     .prepare(
       `INSERT INTO projects (handle, name, ecosystem, pages_json, category, tier, followers_count, posts_7d, posts_30d, avg_eng_7d, cross_mentions_72h, active, updated_at)
-       VALUES (?, ?, 'base', '["basehub"]', 'defi', 1, 10000, 1, 1, 10, 0, 1, ?)`,
+       VALUES (?, ?, 'base', '["basehub","aionbase"]', 'defi', 1, 10000, 1, 1, 10, 0, 1, ?)`,
     )
     .bind("activeproj", "Active Proj", now - 86400)
     .run();
@@ -438,6 +438,13 @@ test("review regressions: briefings, drafts, gold opt-out, windowed doomscroll, 
   expect(basePage.pending_drafts[0].body).toContain("@");
   expect(Array.isArray(basePage.pending_drafts[0].source_urls)).toBe(true);
   expect(typeof basePage.pending_drafts[0].vibe_passed).toBe("boolean");
+
+  // AIonBase (ecosystem='base-ai') also receives signals from Base projects assigned to pages_json
+  const aiBriefing = await callMcp("hub_briefing", { page_id: "aionbase" });
+  const aiPage = aiBriefing.pages[0];
+  expect(aiPage.latest_signal_at).toBe(now - 3600);
+  expect(aiPage.top_signals.length).toBeGreaterThanOrEqual(1);
+  expect(aiPage.top_signals[0].handle).toBe("activeproj");
 
   // Gold opt-out honored even with edited_body
   const decideRes = await callMcp("hub_draft_decide", {
