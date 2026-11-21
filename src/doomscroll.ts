@@ -250,7 +250,10 @@ export async function getDoomscrollHealth(
   const res = await callXeffectTool<Record<string, unknown>>(env, "health", {}, fetchImpl);
   if (res.ok) return { ok: true, status: res.data };
 
-  // Fallback for legacy xeffect deployments that do not expose a `health` tool
+  // Only fall back to tools/list when legacy xeffect has no `health` tool; never mask real health errors
+  if (!res.error || !/tool\s+health\s+not\s+found|unknown\s+tool|not\s+found/i.test(res.error)) {
+    return { ok: false, error: res.error };
+  }
   if (!env.XEFFECT_URL || !env.XEFFECT_TOKEN) {
     return { ok: false, error: res.error };
   }
@@ -272,8 +275,11 @@ export async function getDoomscrollHealth(
     }
     const rpc = parseRpcBody(await listRes.text());
     const toolNames = (rpc.result?.tools ?? []).map((t) => t.name);
-    if (toolNames.length > 0) {
-      return { ok: true, status: { mode: "xeffect-mcp", tools: toolNames } };
+    if (toolNames.length > 0 && !toolNames.includes("health")) {
+      return {
+        ok: true,
+        status: { mode: "xeffect-mcp-legacy", health_tool: "missing", tools: toolNames },
+      };
     }
   } catch {
     // keep original error

@@ -4,6 +4,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   callXeffectTool,
+  getDoomscrollHealth,
   parseXeffectTsvPosts,
   scoreShipText,
   syncDoomscroll,
@@ -627,4 +628,64 @@ test("live integration helpers: SSE+TSV parsing, Host header, and partner CSV sy
     .first<{ posts_7d: number; posts_30d: number }>();
   expect(untouched?.posts_7d).toBe(9);
   expect(untouched?.posts_30d).toBe(12);
+
+  // getDoomscrollHealth must not mask real upstream health failures via tools/list
+  const realErrorFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string };
+    if (body.method === "tools/list") {
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "posts" }] } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        error: { code: -32000, message: "X cookies expired" },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as unknown as typeof fetch;
+
+  const failedHealth = await getDoomscrollHealth(
+    {
+      DB: db,
+      XEFFECT_URL: "https://xeffect.example.workers.dev/mcp",
+      XEFFECT_TOKEN: "tok",
+    },
+    realErrorFetch,
+  );
+  expect(failedHealth.ok).toBe(false);
+  expect(failedHealth.error).toContain("X cookies expired");
+
+  // Legacy xeffect without a `health` tool still reports legacy capability mode
+  const legacyMissingHealthFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const body = JSON.parse(String(init?.body ?? "{}")) as { method?: string };
+    if (body.method === "tools/list") {
+      return new Response(
+        JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [{ name: "posts" }] } }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        error: { code: -32602, message: "Tool health not found" },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as unknown as typeof fetch;
+
+  const legacyHealth = await getDoomscrollHealth(
+    {
+      DB: db,
+      XEFFECT_URL: "https://xeffect.example.workers.dev/mcp",
+      XEFFECT_TOKEN: "tok",
+    },
+    legacyMissingHealthFetch,
+  );
+  expect(legacyHealth.ok).toBe(true);
+  expect((legacyHealth.status as { mode?: string }).mode).toBe("xeffect-mcp-legacy");
 });
