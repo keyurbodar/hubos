@@ -1,5 +1,6 @@
 export interface Env {
   DB: D1Database;
+  XEFFECT?: Fetcher;
   HUB_MCP_TOKEN?: string;
   XEFFECT_URL?: string;
   XEFFECT_TOKEN?: string;

@@ -62,11 +62,102 @@ export function scoreShipText(text: string): { score: number; tags: string[] } {
   return { score: Math.min(25, score), tags };
 }
 
+function parseRpcBody(rawText: string): {
+  result?: {
+    content?: Array<{ text?: string }>;
+    isError?: boolean;
+    tools?: Array<{ name: string }>;
+  };
+  error?: { message?: string };
+} {
+  const trimmed = rawText.trim();
+  if (trimmed.startsWith("{")) {
+    return JSON.parse(trimmed) as {
+      result?: {
+        content?: Array<{ text?: string }>;
+        isError?: boolean;
+        tools?: Array<{ name: string }>;
+      };
+      error?: { message?: string };
+    };
+  }
+  const dataLines = trimmed
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("data:"))
+    .map((line) => line.slice(5).trim())
+    .filter(Boolean);
+  for (let i = dataLines.length - 1; i >= 0; i -= 1) {
+    const candidate = dataLines[i];
+    if (candidate?.startsWith("{")) {
+      return JSON.parse(candidate) as {
+        result?: {
+          content?: Array<{ text?: string }>;
+          isError?: boolean;
+          tools?: Array<{ name: string }>;
+        };
+        error?: { message?: string };
+      };
+    }
+  }
+  throw new XeffectRpcError({ message: "Unparseable xeffect response" });
+}
+
+function parseIntOrZero(value: string | undefined): number {
+  if (!value || value === "-") return 0;
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+export function parseXeffectTsvPosts(tsv: string): XeffectPost[] {
+  const lines = tsv.split(/\r?\n/).filter((l) => l.trim().length > 0);
+  const headerIdx = lines.findIndex((l) => l.startsWith("id\t@user\t"));
+  if (headerIdx < 0) return [];
+  const cols = lines[headerIdx]?.split("\t") ?? [];
+  const colIdx = new Map(cols.map((name, i) => [name.trim(), i]));
+  const posts: XeffectPost[] = [];
+
+  for (let i = headerIdx + 1; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line || line.startsWith("ERR\t") || line.startsWith("#")) continue;
+    const parts = line.split("\t");
+    const postId = parts[colIdx.get("id") ?? 0] ?? "";
+    const rawUser = parts[colIdx.get("@user") ?? 1] ?? "";
+    const timeStr = parts[colIdx.get("time") ?? 2] ?? "";
+    const text = (parts[colIdx.get("text") ?? 5] ?? "").replace(/\\n/g, "\n").replace(/\\t/g, "\t");
+    const url = parts[colIdx.get("url") ?? 15] ?? "";
+    if (!postId || !rawUser || !url || url === "-") continue;
+    const ms = Date.parse(timeStr);
+    const createdAt = Number.isFinite(ms) ? Math.floor(ms / 1000) : Math.floor(Date.now() / 1000);
+    posts.push({
+      post_id: postId,
+      handle: rawUser.replace(/^@+/, "").toLowerCase(),
+      text,
+      url,
+      created_at: createdAt,
+      likes: parseIntOrZero(parts[colIdx.get("likes") ?? 9]),
+      reposts: parseIntOrZero(parts[colIdx.get("reposts") ?? 11]),
+      bookmarks: parseIntOrZero(parts[colIdx.get("bookmarks") ?? 13]),
+      views: parseIntOrZero(parts[colIdx.get("views") ?? 14]),
+    });
+  }
+  return posts;
+}
+
+function resolveXeffectFetch(env: Env, fetchImpl?: typeof fetch): typeof fetch {
+  if (fetchImpl) return fetchImpl;
+  if (env.XEFFECT) {
+    const service = env.XEFFECT;
+    return ((input: RequestInfo | URL, init?: RequestInit) =>
+      service.fetch(input, init)) as typeof fetch;
+  }
+  return fetch;
+}
+
 export function callXeffectEffect<T>(
   env: Env,
   toolName: string,
   args: Record<string, unknown>,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl?: typeof fetch,
 ): Effect.Effect<T, XeffectConfigError | XeffectHttpError | XeffectRpcError> {
   const url = env.XEFFECT_URL;
   const token = env.XEFFECT_TOKEN;
@@ -75,13 +166,16 @@ export function callXeffectEffect<T>(
       new XeffectConfigError({ message: "XEFFECT_URL or XEFFECT_TOKEN not configured" }),
     );
   }
+  const doFetch = resolveXeffectFetch(env, fetchImpl);
 
   const requestOnce = Effect.tryPromise({
     try: async () => {
-      const res = await fetchImpl(url, {
+      const res = await doFetch(url, {
         method: "POST",
         headers: {
           "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          host: new URL(url).host,
           authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
@@ -90,15 +184,17 @@ export function callXeffectEffect<T>(
           method: "tools/call",
           params: { name: toolName, arguments: args },
         }),
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(25000),
       });
       if (!res.ok) {
-        throw new XeffectHttpError({ status: res.status, message: `xeffect HTTP ${res.status}` });
+        const errBody = await res.text().catch(() => "");
+        const detail = errBody ? `: ${errBody.slice(0, 200)}` : "";
+        throw new XeffectHttpError({
+          status: res.status,
+          message: `xeffect HTTP ${res.status}${detail}`,
+        });
       }
-      const rpc = (await res.json()) as {
-        result?: { content?: Array<{ text?: string }>; isError?: boolean };
-        error?: { message?: string };
-      };
+      const rpc = parseRpcBody(await res.text());
       if (rpc.error) {
         throw new XeffectRpcError({ message: rpc.error.message ?? "xeffect RPC error" });
       }
@@ -108,7 +204,11 @@ export function callXeffectEffect<T>(
         });
       }
       const raw = rpc.result?.content?.[0]?.text ?? "{}";
-      return JSON.parse(raw) as T;
+      const trimmed = raw.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        return JSON.parse(trimmed) as T;
+      }
+      return { raw, posts: parseXeffectTsvPosts(raw) } as T;
     },
     catch: (err) => {
       if (err instanceof XeffectHttpError || err instanceof XeffectRpcError) return err;
@@ -132,7 +232,7 @@ export async function callXeffectTool<T>(
   env: Env,
   toolName: string,
   args: Record<string, unknown>,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl?: typeof fetch,
 ): Promise<{ ok: boolean; data?: T; error?: string }> {
   const result = await Effect.runPromise(
     callXeffectEffect<T>(env, toolName, args, fetchImpl).pipe(
@@ -145,18 +245,46 @@ export async function callXeffectTool<T>(
 
 export async function getDoomscrollHealth(
   env: Env,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl?: typeof fetch,
 ): Promise<{ ok: boolean; status?: unknown; error?: string }> {
   const res = await callXeffectTool<Record<string, unknown>>(env, "health", {}, fetchImpl);
-  if (!res.ok) return { ok: false, error: res.error };
-  return { ok: true, status: res.data };
+  if (res.ok) return { ok: true, status: res.data };
+
+  // Fallback for legacy xeffect deployments that do not expose a `health` tool
+  if (!env.XEFFECT_URL || !env.XEFFECT_TOKEN) {
+    return { ok: false, error: res.error };
+  }
+  try {
+    const doFetch = resolveXeffectFetch(env, fetchImpl);
+    const listRes = await doFetch(env.XEFFECT_URL, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        host: new URL(env.XEFFECT_URL).host,
+        authorization: `Bearer ${env.XEFFECT_TOKEN}`,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: Date.now(), method: "tools/list" }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!listRes.ok) {
+      return { ok: false, error: res.error ?? `xeffect HTTP ${listRes.status}` };
+    }
+    const rpc = parseRpcBody(await listRes.text());
+    const toolNames = (rpc.result?.tools ?? []).map((t) => t.name);
+    if (toolNames.length > 0) {
+      return { ok: true, status: { mode: "xeffect-mcp", tools: toolNames } };
+    }
+  } catch {
+    // keep original error
+  }
+  return { ok: false, error: res.error };
 }
 
 export async function syncDoomscroll(
   env: Env,
   opts: { ecosystem?: string; hours?: number; fetchImpl?: typeof fetch } = {},
 ): Promise<{ ok: boolean; signals_upserted: number; projects_updated: number; error?: string }> {
-  const fetchImpl = opts.fetchImpl ?? fetch;
   const hours = opts.hours ?? 72;
 
   const projectsRes = opts.ecosystem
@@ -173,17 +301,41 @@ export async function syncDoomscroll(
   const byHandle = new Map(projects.map((p) => [p.handle.toLowerCase(), p]));
   const handles = projects.map((p) => p.handle);
 
+  let posts: XeffectPost[] = [];
   const postsRes = await callXeffectTool<{ posts?: XeffectPost[] }>(
     env,
     "posts",
     { accounts: handles, hours, limit: 200 },
-    fetchImpl,
+    opts.fetchImpl,
   );
-  if (!postsRes.ok) {
+  if (postsRes.ok) {
+    posts = postsRes.data?.posts ?? [];
+  } else if (postsRes.error && /targets|invalid_type|required/i.test(postsRes.error)) {
+    // Legacy xeffect `posts` schema: `{ targets: [{ handle, since, last }] }` (max 50 per call)
+    const chunkSize = 20;
+    const errors: string[] = [];
+    for (let i = 0; i < handles.length; i += chunkSize) {
+      const batch = handles.slice(i, i + chunkSize);
+      const batchRes = await callXeffectTool<{ posts?: XeffectPost[] }>(
+        env,
+        "posts",
+        {
+          targets: batch.map((handle) => ({ handle, since: `${hours}h`, last: 5 })),
+        },
+        opts.fetchImpl,
+      );
+      if (batchRes.ok && batchRes.data?.posts) {
+        posts.push(...batchRes.data.posts);
+      } else if (batchRes.error) {
+        errors.push(batchRes.error);
+      }
+    }
+    if (posts.length === 0 && errors.length > 0) {
+      return { ok: false, signals_upserted: 0, projects_updated: 0, error: errors[0] };
+    }
+  } else {
     return { ok: false, signals_upserted: 0, projects_updated: 0, error: postsRes.error };
   }
-
-  const posts = postsRes.data?.posts ?? [];
 
   let upserted = 0;
   for (const post of posts) {

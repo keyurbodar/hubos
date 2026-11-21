@@ -2,9 +2,15 @@ import { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { callXeffectTool, scoreShipText, syncDoomscroll } from "../src/doomscroll.ts";
+import {
+  callXeffectTool,
+  parseXeffectTsvPosts,
+  scoreShipText,
+  syncDoomscroll,
+} from "../src/doomscroll.ts";
 import { app } from "../src/index.ts";
 import { handleHubMcp } from "../src/mcp.ts";
+import { listActivePartners, syncPartnersFromCsv } from "../src/partners.ts";
 import { rankProjectsForSeries, recordPickDecision } from "../src/picker.ts";
 import type { Env } from "../src/types.ts";
 import { runVibeCheck } from "../src/vibe-check.ts";
@@ -481,4 +487,61 @@ test("review regressions: briefings, drafts, gold opt-out, windowed doomscroll, 
   });
   const activeCandidate = ranked.candidates.find((c) => c.handle === "activeproj");
   expect(activeCandidate?.scores.cooldown).toBeLessThanOrEqual(-40);
+});
+
+test("live integration helpers: SSE+TSV parsing, Host header, and partner CSV sync", async () => {
+  const tsv = [
+    "#OK ok=1 err=0 ms=42 posts=1",
+    "id\t@user\ttime\tkind\tthread\ttext\timages\tlinks\tquote\tlikes\treplies\treposts\tquotes\tbookmarks\tviews\turl\tquote_url\tretweeted_by\treply_to",
+    "123\t@UseOttoAI\t2026-11-20T10:00:00Z\tpost\t-\tShipped mainnet v2\\nLive now\t-\t-\t-\t12\t1\t3\t0\t5\t900\thttps://x.com/useottoai/status/123\t-\t-\t-",
+  ].join("\n");
+  const parsed = parseXeffectTsvPosts(tsv);
+  expect(parsed).toHaveLength(1);
+  expect(parsed[0]?.handle).toBe("useottoai");
+  expect(parsed[0]?.text).toBe("Shipped mainnet v2\nLive now");
+  expect(parsed[0]?.likes).toBe(12);
+
+  let seenHost = "";
+  const sseFetch = (async (_url: RequestInfo | URL, init?: RequestInit) => {
+    const headers = new Headers(init?.headers);
+    seenHost = headers.get("host") ?? "";
+    const payload = JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      result: { content: [{ type: "text", text: tsv }] },
+    });
+    return new Response(`event: message\ndata: ${payload}\n\n`, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  }) as unknown as typeof fetch;
+
+  const res = await callXeffectTool<{ posts?: unknown[] }>(
+    {
+      DB: createMockD1(),
+      XEFFECT_URL: "https://xeffect.example.workers.dev/mcp",
+      XEFFECT_TOKEN: "tok",
+    },
+    "posts",
+    { targets: [{ handle: "useottoai", since: "72h", last: 5 }] },
+    sseFetch,
+  );
+  expect(res.ok).toBe(true);
+  expect(seenHost).toBe("xeffect.example.workers.dev");
+  expect(res.data?.posts).toHaveLength(1);
+
+  const db = createMockD1();
+  const csv = [
+    ",Freq,Active partners,Expired Partner ,Blacklist",
+    "Base,HIGH,https://x.com/Uptopia_xyz,https://x.com/Wach_AI,https://x.com/Stonxfun",
+    "Robinhood,MEDIUM,https://x.com/DogestarOnRH,,",
+  ].join("\n");
+  const csvFetch = (async () => new Response(csv, { status: 200 })) as unknown as typeof fetch;
+  const synced = await syncPartnersFromCsv(db, "https://sheets.example/partners.csv", csvFetch);
+  expect(synced.ok).toBe(true);
+  expect(synced.synced).toBe(4);
+  const activeBase = await listActivePartners(db, "basehub");
+  expect(activeBase.map((p) => p.handle)).toEqual(["uptopia_xyz"]);
+  const activeRh = await listActivePartners(db, "robinhub");
+  expect(activeRh.map((p) => p.handle)).toEqual(["dogestaronrh"]);
 });

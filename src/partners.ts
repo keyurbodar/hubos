@@ -59,3 +59,92 @@ export async function upsertPartner(
     )
     .run();
 }
+
+function extractXHandle(cell: string | undefined): string | null {
+  if (!cell) return null;
+  const match = cell.trim().match(/(?:x\.com|twitter\.com)\/([A-Za-z0-9_]+)/i);
+  return match?.[1] ? match[1].toLowerCase() : null;
+}
+
+function pagesForSection(section: string): string[] {
+  const s = section.trim().toLowerCase();
+  if (s === "base") return ["basehub", "aionbase"];
+  if (s === "robinhood") return ["robinhub", "robinhoodhub"];
+  if (s === "elysium") return ["elysiumhub"];
+  return [];
+}
+
+/**
+ * Parse and sync the Hub partner sheet CSV (sections: Base, Robinhood, Elysium).
+ */
+export async function syncPartnersFromCsv(
+  db: D1Database,
+  csvUrl: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ ok: boolean; synced: number; error?: string }> {
+  try {
+    const res = await fetchImpl(csvUrl, { signal: AbortSignal.timeout(15000) });
+    if (!res.ok) {
+      return { ok: false, synced: 0, error: `Partner CSV HTTP ${res.status}` };
+    }
+    const text = await res.text();
+    const lines = text.split(/\r?\n/);
+    let currentSection = "";
+    let synced = 0;
+
+    for (const line of lines) {
+      const cols = line.split(",").map((c) => c.trim());
+      if (cols[0]) {
+        currentSection = cols[0];
+      }
+      const pages = pagesForSection(currentSection);
+      if (pages.length === 0) continue;
+
+      const freq = cols[1] || "MEDIUM";
+      const activeHandle = extractXHandle(cols[2]);
+      const expiredHandle = extractXHandle(cols[3]);
+      const blacklistHandle = extractXHandle(cols[4]);
+
+      if (activeHandle) {
+        await upsertPartner(db, {
+          partner_id: `${currentSection.toLowerCase()}_${activeHandle}`,
+          name: activeHandle,
+          handle: activeHandle,
+          pages,
+          deliverable: `Partner coverage (${freq})`,
+          brief_url: cols[2]?.trim() || null,
+          status: "active",
+        });
+        synced += 1;
+      }
+      if (expiredHandle) {
+        await upsertPartner(db, {
+          partner_id: `${currentSection.toLowerCase()}_${expiredHandle}`,
+          name: expiredHandle,
+          handle: expiredHandle,
+          pages,
+          deliverable: "Expired partner",
+          brief_url: cols[3]?.trim() || null,
+          status: "expired",
+        });
+        synced += 1;
+      }
+      if (blacklistHandle) {
+        await upsertPartner(db, {
+          partner_id: `${currentSection.toLowerCase()}_${blacklistHandle}`,
+          name: blacklistHandle,
+          handle: blacklistHandle,
+          pages,
+          deliverable: "Blacklisted",
+          brief_url: cols[4]?.trim() || null,
+          status: "blacklist",
+        });
+        synced += 1;
+      }
+    }
+
+    return { ok: true, synced };
+  } catch (err) {
+    return { ok: false, synced: 0, error: String(err) };
+  }
+}

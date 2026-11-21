@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { syncDoomscroll } from "./doomscroll.ts";
 import { handleHubMcp } from "./mcp.ts";
+import { syncPartnersFromCsv } from "./partners.ts";
 import type { Env } from "./types.ts";
 
 const app = new Hono<{ Bindings: Env }>();
@@ -28,6 +29,9 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     if (env.XEFFECT_URL && env.XEFFECT_TOKEN) {
       await syncDoomscroll(env, { hours: 72 });
+    }
+    if (env.PARTNER_SHEET_CSV_URL) {
+      await syncPartnersFromCsv(env.DB, env.PARTNER_SHEET_CSV_URL);
     }
   },
 };

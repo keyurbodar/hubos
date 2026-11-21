@@ -1,6 +1,6 @@
 import { getDoomscrollHealth, syncDoomscroll } from "./doomscroll.ts";
 import { getGoldExamples, getRecentHooks, getTopPerformingHooks } from "./metrics.ts";
-import { listActivePartners, upsertPartner } from "./partners.ts";
+import { listActivePartners, syncPartnersFromCsv, upsertPartner } from "./partners.ts";
 import { rankProjectsForSeries, recordPickDecision } from "./picker.ts";
 import type { Env, PageConfig } from "./types.ts";
 import { runVibeCheck } from "./vibe-check.ts";
@@ -108,11 +108,11 @@ const TOOLS = [
   {
     name: "hub_partners",
     description:
-      "List or upsert isolated partner briefs and deliverables (kept separate from organic signals).",
+      "List, sync from the partner CSV sheet, or upsert isolated partner briefs and deliverables (kept separate from organic signals).",
     inputSchema: {
       type: "object",
       properties: {
-        action: { type: "string", enum: ["list", "upsert"], default: "list" },
+        action: { type: "string", enum: ["list", "sync", "upsert"], default: "list" },
         page_id: { type: "string" },
         partner: { type: "object" },
       },
@@ -155,7 +155,7 @@ function toolResult(data: unknown, isError = false) {
 export async function handleHubMcp(
   req: Request,
   env: Env,
-  fetchImpl: typeof fetch = fetch,
+  fetchImpl?: typeof fetch,
 ): Promise<Response> {
   if (!env.HUB_MCP_TOKEN) {
     return new Response("HUB_MCP_TOKEN not configured", { status: 503 });
@@ -427,6 +427,26 @@ export async function handleHubMcp(
 
     if (name === "hub_partners") {
       const action = String(args.action ?? "list");
+      if (action === "sync") {
+        if (!env.PARTNER_SHEET_CSV_URL) {
+          return okRpc(
+            body.id,
+            toolResult(
+              { ok: false, synced: 0, error: "PARTNER_SHEET_CSV_URL not configured" },
+              true,
+            ),
+          );
+        }
+        const res = await syncPartnersFromCsv(env.DB, env.PARTNER_SHEET_CSV_URL, fetchImpl);
+        const partners = await listActivePartners(
+          env.DB,
+          typeof args.page_id === "string" ? args.page_id : undefined,
+        );
+        return okRpc(
+          body.id,
+          toolResult({ ...res, active_count: partners.length, partners }, !res.ok),
+        );
+      }
       if (action === "upsert" && args.partner && typeof args.partner === "object") {
         await upsertPartner(env.DB, args.partner as Parameters<typeof upsertPartner>[1]);
         return okRpc(body.id, toolResult({ ok: true }));

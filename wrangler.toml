@@ -3,12 +3,15 @@ main = "src/index.ts"
 compatibility_date = "2026-10-01"
 compatibility_flags = ["nodejs_compat"]
 
-# Replace database_id with the UUID output by `npx wrangler d1 create hubos-db`
 [[d1_databases]]
 binding = "DB"
 database_name = "hubos-db"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "d8041392-d9cc-43f1-b745-995f39bf1c81"
 migrations_dir = "migrations"
+
+[[services]]
+binding = "XEFFECT"
+service = "xeffect"
 
 # Daily 10:00 IST (04:30 UTC) sync of doomscroll signals + partner sheet + post metrics
 [triggers]
