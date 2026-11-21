@@ -184,8 +184,6 @@ export async function syncDoomscroll(
   }
 
   const posts = postsRes.data?.posts ?? [];
-  const mentionCounts = new Map<string, number>();
-  const engTotals = new Map<string, { sum: number; count: number }>();
 
   let upserted = 0;
   for (const post of posts) {
@@ -223,31 +221,85 @@ export async function syncDoomscroll(
       )
       .run();
     upserted += 1;
+  }
 
-    const eng = (post.likes ?? 0) + (post.reposts ?? 0) * 2 + (post.bookmarks ?? 0) * 3;
-    const prev = engTotals.get(h) ?? { sum: 0, count: 0 };
-    prev.sum += eng;
-    prev.count += 1;
-    engTotals.set(h, prev);
+  const now = Math.floor(Date.now() / 1000);
+  const cutoff30d = now - 30 * 86400;
+  const cutoff7d = now - 7 * 86400;
+  const cutoff72h = now - 72 * 3600;
 
-    for (const target of byHandle.keys()) {
-      if (target !== h && new RegExp(`@${target}\\b`, "i").test(post.text)) {
-        mentionCounts.set(target, (mentionCounts.get(target) ?? 0) + 1);
+  const recentSignalsRes = opts.ecosystem
+    ? await env.DB.prepare(
+        `SELECT handle, text, created_at, likes, reposts, bookmarks
+         FROM signals
+         WHERE ecosystem = ? AND created_at >= ?`,
+      )
+        .bind(opts.ecosystem, cutoff30d)
+        .all<{
+          handle: string;
+          text: string;
+          created_at: number;
+          likes: number;
+          reposts: number;
+          bookmarks: number;
+        }>()
+    : await env.DB.prepare(
+        `SELECT handle, text, created_at, likes, reposts, bookmarks
+         FROM signals
+         WHERE created_at >= ?`,
+      )
+        .bind(cutoff30d)
+        .all<{
+          handle: string;
+          text: string;
+          created_at: number;
+          likes: number;
+          reposts: number;
+          bookmarks: number;
+        }>();
+
+  const statsByHandle = new Map<
+    string,
+    { posts30d: number; posts7d: number; engSum7d: number; crossMentions72h: number }
+  >();
+  for (const h of byHandle.keys()) {
+    statsByHandle.set(h, { posts30d: 0, posts7d: 0, engSum7d: 0, crossMentions72h: 0 });
+  }
+
+  for (const sig of recentSignalsRes.results ?? []) {
+    const h = sig.handle.toLowerCase();
+    const entry = statsByHandle.get(h);
+    if (entry) {
+      entry.posts30d += 1;
+      if (sig.created_at >= cutoff7d) {
+        entry.posts7d += 1;
+        entry.engSum7d += (sig.likes ?? 0) + (sig.reposts ?? 0) * 2 + (sig.bookmarks ?? 0) * 3;
+      }
+    }
+    if (sig.created_at >= cutoff72h) {
+      for (const [target, targetStats] of statsByHandle.entries()) {
+        if (target !== h && new RegExp(`@${target}\\b`, "i").test(sig.text)) {
+          targetStats.crossMentions72h += 1;
+        }
       }
     }
   }
 
-  const now = Math.floor(Date.now() / 1000);
   let updated = 0;
-  for (const [handle, stats] of engTotals.entries()) {
-    const avgEng = stats.count > 0 ? stats.sum / stats.count : 0;
-    const crossMentions = mentionCounts.get(handle) ?? 0;
+  for (const p of projects) {
+    const stats = statsByHandle.get(p.handle.toLowerCase()) ?? {
+      posts30d: 0,
+      posts7d: 0,
+      engSum7d: 0,
+      crossMentions72h: 0,
+    };
+    const avgEng7d = stats.posts7d > 0 ? stats.engSum7d / stats.posts7d : 0;
     await env.DB.prepare(`
       UPDATE projects
-      SET posts_7d = ?, avg_eng_7d = ?, cross_mentions_72h = ?, updated_at = ?
+      SET posts_7d = ?, posts_30d = ?, avg_eng_7d = ?, cross_mentions_72h = ?, updated_at = ?
       WHERE handle = ?
     `)
-      .bind(stats.count, avgEng, crossMentions, now, handle)
+      .bind(stats.posts7d, stats.posts30d, avgEng7d, stats.crossMentions72h, now, p.handle)
       .run();
     updated += 1;
   }
