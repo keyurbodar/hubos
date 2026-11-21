@@ -196,23 +196,64 @@ export async function handleHubMcp(
         : await env.DB.prepare("SELECT * FROM pages ORDER BY page_id ASC").all<PageConfig>();
       const pages = pagesRes.results ?? [];
 
+      const now = Math.floor(Date.now() / 1000);
+      const signalCutoff = now - 72 * 3600;
       const briefings = await Promise.all(
         pages.map(async (p) => {
-          const [partners, topHooks, goldExamples, pending] = await Promise.all([
-            listActivePartners(env.DB, p.page_id),
-            getTopPerformingHooks(env.DB, p.page_id, 14),
-            getGoldExamples(env.DB, p.page_id),
-            env.DB.prepare(
-              "SELECT draft_id, series, target_handle, status, created_at FROM drafts WHERE page_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 10",
-            )
-              .bind(p.page_id)
-              .all(),
-          ]);
+          const [partners, topHooks, goldExamples, pending, signalsRes, latestSig] =
+            await Promise.all([
+              listActivePartners(env.DB, p.page_id),
+              getTopPerformingHooks(env.DB, p.page_id, 14),
+              getGoldExamples(env.DB, p.page_id),
+              env.DB.prepare(
+                "SELECT draft_id, series, target_handle, status, created_at FROM drafts WHERE page_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 10",
+              )
+                .bind(p.page_id)
+                .all(),
+              env.DB.prepare(
+                `SELECT signal_id, handle, text, source_url, created_at, likes, reposts, bookmarks, views, ship_score, ship_tags_json
+                 FROM signals
+                 WHERE ecosystem = ? AND created_at >= ?
+                 ORDER BY ship_score DESC, created_at DESC
+                 LIMIT 15`,
+              )
+                .bind(p.ecosystem, signalCutoff)
+                .all<{
+                  signal_id: string;
+                  handle: string;
+                  text: string;
+                  source_url: string;
+                  created_at: number;
+                  likes: number;
+                  reposts: number;
+                  bookmarks: number;
+                  views: number;
+                  ship_score: number;
+                  ship_tags_json: string;
+                }>(),
+              env.DB.prepare("SELECT MAX(created_at) as latest FROM signals WHERE ecosystem = ?")
+                .bind(p.ecosystem)
+                .first<{ latest: number | null }>(),
+            ]);
           return {
             page_id: p.page_id,
             name: p.name,
             ecosystem: p.ecosystem,
             voice_rules: p.voice_rules,
+            latest_signal_at: latestSig?.latest ?? null,
+            top_signals: (signalsRes.results ?? []).map((s) => ({
+              signal_id: s.signal_id,
+              handle: s.handle,
+              text: s.text,
+              source_url: s.source_url,
+              created_at: s.created_at,
+              likes: s.likes,
+              reposts: s.reposts,
+              bookmarks: s.bookmarks,
+              views: s.views,
+              ship_score: s.ship_score,
+              ship_tags: JSON.parse(s.ship_tags_json || "[]") as string[],
+            })),
             pending_drafts: pending.results ?? [],
             active_partners: partners,
             top_hooks_14d: topHooks,
