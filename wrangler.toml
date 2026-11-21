@@ -1,0 +1,24 @@
+name = "hubos"
+main = "src/index.ts"
+compatibility_date = "2026-10-01"
+compatibility_flags = ["nodejs_compat"]
+
+# Replace database_id with the UUID output by `npx wrangler d1 create hubos-db`
+[[d1_databases]]
+binding = "DB"
+database_name = "hubos-db"
+database_id = "00000000-0000-0000-0000-000000000000"
+migrations_dir = "migrations"
+
+# Daily 10:00 IST (04:30 UTC) sync of doomscroll signals + partner sheet + post metrics
+[triggers]
+crons = ["30 4 * * 1-6"]
+
+[vars]
+XEFFECT_URL = "https://xeffect.keyurbodar18.workers.dev/mcp"
+
+# Secrets (set via `wrangler secret put`):
+# - HUB_MCP_TOKEN: bearer token for hubos /mcp
+# - XEFFECT_TOKEN: bearer token for the general xeffect /mcp server
+# - PARTNER_SHEET_CSV_URL: optional private CSV export URL for partner tracker
+# - NOTION_TOKEN: optional Notion integration token (read-only until approved)
